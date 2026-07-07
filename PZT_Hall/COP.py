@@ -12,17 +12,17 @@ import threading
 COP_INIT_MEDIAN_FRAMES = 1              # 初始COP取中位数的帧数
 COP_BASELINE_COLLECT_FRAMES = 20        # 基线采集帧数（用于动态阈值计算）
 COP_THRESH_K = 5                        # 阈值乘数：mean + K * std
-COP_SENSOR_ROW_CNT = 6                  # 传感器阵列行数
-COP_SENSOR_COL_CNT = 13                 # 传感器阵列列数
+COP_SENSOR_ROW_CNT = 13                 # 传感器阵列行数
+COP_SENSOR_COL_CNT = 6                  # 传感器阵列列数
 
 
 # ===================== 二次静置精修参数 =====================
 COP_POST_INIT_WINDOW_CNT = 600000        # 初始CoP确定后精修监测帧数上限
-COP_POST_INIT_STABLE_CNT = 100           # 原始模式：精修阶段需连续保持不变的帧数
+COP_POST_INIT_STABLE_CNT = 10            # 原始模式：精修阶段需连续保持不变的帧数
 COP_POST_INIT_STABLE_THRESH = 0.1        # 精修判据：CoP偏移距离阈值
 COP_POST_INIT_TRIGGER_CNT = 20           # 触发模式：收到触发信号后需连续保持不变的帧数
 
-COP_SNAP_CENTER_X, COP_SNAP_CENTER_Y = 6.0, 2.5   # 吸附目标（阵列中心）
+COP_SNAP_CENTER_X, COP_SNAP_CENTER_Y = 2.5, 6.0   # 吸附目标（阵列中心）
 COP_SNAP_RANGE_X = 0.0                # X方向吸附范围
 COP_SNAP_RANGE_Y = 0.0                # Y方向吸附范围
 

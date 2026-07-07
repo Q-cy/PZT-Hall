@@ -92,26 +92,26 @@ class PressureSensor:                              # 为什么定义成类而不
 
     def decode(self, raw):
         """解码为 PZT(78通道) + Hall(4传感器)"""
-        # PZT: 前156字节 → 78个uint16，按6行×13列重排
+        # PZT: 前156字节 → 78个uint16，按13行×6列重排
         pzt_data = [struct.unpack("<H", raw[i:i+2])[0] for i in range(0, 156, 2)]
         out = []
-        for i in range(6):
-            out.extend(pzt_data[i*13:(i+1)*13])
+        for i in range(13):
+            out.extend(pzt_data[i*6:(i+1)*6])
 
-        # Hall: 后32字节 → 4个TMAG3001传感器，每个8字节(大端int16)
-        hall_data = []
-        for s in range(4):
-            off = 156 + s * 8
-            temp_raw = struct.unpack(">h", raw[off:off+2])[0]
-            mag_x_raw = struct.unpack(">h", raw[off+2:off+4])[0]
-            mag_y_raw = struct.unpack(">h", raw[off+4:off+6])[0]
-            mag_z_raw = struct.unpack(">h", raw[off+6:off+8])[0]
-            hall_data.append({
+        # Hall: 后32字节 → 4个TMAG3001传感器，每个8字节(小端int16)
+        # 顺序：hall2(164), hall4(180), hall1(156), hall3(172)
+        def _decode_hall(off):
+            temp_raw = struct.unpack("<h", raw[off:off+2])[0]
+            mag_x_raw = struct.unpack("<h", raw[off+2:off+4])[0]
+            mag_y_raw = struct.unpack("<h", raw[off+4:off+6])[0]
+            mag_z_raw = struct.unpack("<h", raw[off+6:off+8])[0]
+            return {
                 "temp_c": 25.0 + (temp_raw - 17512) / 58.2,
                 "mag_x": mag_x_raw / 885.0 * 10.0,
                 "mag_y": mag_y_raw / 885.0 * 10.0,
                 "mag_z": mag_z_raw / 885.0 * 10.0,
-            })
+            }
+        hall_data = [_decode_hall(164), _decode_hall(180), _decode_hall(156), _decode_hall(172)]
 
         return out, hall_data
 

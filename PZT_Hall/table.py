@@ -3,6 +3,7 @@
 import os
 import csv
 import numpy as np
+from datetime import datetime
 
 TABLE_CSV_HEADER = [  # CSV 文件表头（78通道PZT + 16通道Hall + 时间戳 + 力/角度/标定数据）
     "timestamp", "rel_ms", "adc_sum",
@@ -14,10 +15,10 @@ TABLE_CSV_HEADER = [  # CSV 文件表头（78通道PZT + 16通道Hall + 时间�
     "ch53", "ch54", "ch55", "ch56", "ch57", "ch58", "ch59", "ch60", "ch61", "ch62", "ch63", "ch64", "ch65",
     "ch66", "ch67", "ch68", "ch69", "ch70", "ch71", "ch72", "ch73", "ch74", "ch75", "ch76", "ch77", "ch78",
     # Hall传感器数据 (4×TMAG3001)
-    "hall0_temp", "hall0_mag_x", "hall0_mag_y", "hall0_mag_z",
     "hall1_temp", "hall1_mag_x", "hall1_mag_y", "hall1_mag_z",
     "hall2_temp", "hall2_mag_x", "hall2_mag_y", "hall2_mag_z",
     "hall3_temp", "hall3_mag_x", "hall3_mag_y", "hall3_mag_z",
+    "hall4_temp", "hall4_mag_x", "hall4_mag_y", "hall4_mag_z",
     # 力传感器数据
     "Fx", "Fy", "Fz", "Mx", "My", "Mz",
     # 时间戳相关
@@ -36,15 +37,16 @@ TABLE_CSV_HEADER = [  # CSV 文件表头（78通道PZT + 16通道Hall + 时间�
 
 def auto_get_csv_path(save_dir: str) -> str:
     """
-    自动生成不重复的CSV文件路径（格式：data_1.csv, data_2.csv...）
+    自动生成不重复的CSV文件路径（格式：PH_MMDD_1.csv, PH_MMDD_2.csv...）
     :param save_dir: 保存目录
     :return: 完整的CSV文件路径
     """
     os.makedirs(save_dir, exist_ok=True)
+    date_str = datetime.now().strftime("%m%d")
     idx = 1
-    while os.path.exists(f"{save_dir}/data_{idx}.csv"):
+    while os.path.exists(f"{save_dir}/PH_{date_str}_{idx}.csv"):
         idx += 1
-    return f"{save_dir}/data_{idx}.csv"
+    return f"{save_dir}/PH_{date_str}_{idx}.csv"
 
 def init_csv_file(file_path: str) -> tuple[csv.writer, object]:
     """

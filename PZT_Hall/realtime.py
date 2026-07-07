@@ -14,8 +14,9 @@ PLOT_ERR_HISTORY_LEN = 100     # 角度误差历史缓冲区长度
 PLOT_MAG_HISTORY_LEN = 100     # 幅值历史缓冲区长度
 
 def _yrange(data, pad=0.1):
-    if len(data) < 2: return -1, 1
-    mn, mx = min(data), max(data)
+    clean = [v for v in data if not np.isnan(v)]
+    if len(clean) < 2: return -1, 1
+    mn, mx = min(clean), max(clean)
     r = mx - mn if mx != mn else 1
     return mn - r * pad, mx + r * pad
 
@@ -105,7 +106,7 @@ class GridLinesItem(pg.GraphicsObject):
 
 class RealTimePlot:
     def __init__(self):
-        self.rows, self.cols = 6, 13
+        self.rows, self.cols = 13, 6
         self.lock = threading.Lock()
         self._fps_times = deque(maxlen=30)
         self._heat_vmax = 500.0   # 热力图色阶下限
@@ -119,6 +120,7 @@ class RealTimePlot:
         self.full_fz_list, self.full_fx_list, self.full_fy_list = [], [], []
         self.full_cal_angle_list, self.full_cal_mag_list = [], []
         self.full_fx_cal_list, self.full_fy_cal_list = [], []
+        self.full_fz_cal_list = []
 
         self.init_defaults()
         self.init_history()
@@ -132,7 +134,7 @@ class RealTimePlot:
         self._pzt_mag_val = 0.0             # PZT幅值
         self._force_angle_deg = 0.0         # 六维力方向角度(度)
         self._force_mag_val = 0.0           # 六维力幅值
-        self._press_table_arr = np.zeros((6, 13))  # 压力表数据(6×13)
+        self._press_table_arr = np.zeros((13, 6))  # 压力表数据(13×6)
         self._cop_curr_x = 0.0              # 当前CoP X
         self._cop_curr_y = 0.0              # 当前CoP Y
         self._cop_base_x = 0.0              # 初始CoP X
@@ -145,6 +147,7 @@ class RealTimePlot:
         self._total_press_val = 0.0         # 总压力值
         self._cal_fx_val = None             # 标定力Fx
         self._cal_fy_val = None             # 标定力Fy
+        self._cal_fz_val = None             # 标定力Fz
         self._cal_angle_deg = None          # 标定力角度(度)
         self._cal_mag_val = None            # 标定力幅值
         self._cop_state = 0                 # CoP状态(0=未接触,1=粗略,2=精细)
@@ -163,6 +166,11 @@ class RealTimePlot:
         self.raw_force_mag_history = deque(maxlen=hist_len)
         self.force_fx_cal_history = deque(maxlen=hist_len)
         self.force_fy_cal_history = deque(maxlen=hist_len)
+        self.force_fz_cal_history = deque(maxlen=hist_len)
+        # Hall传感器历史
+        for s in range(4):
+            for axis in ['x', 'y', 'z']:
+                setattr(self, f'hall{s}_{axis}_history', deque(maxlen=hist_len))
 
     # ===== 手工箭头工具 =====
     def _make_arrow_parts(self, plot):
@@ -177,7 +185,7 @@ class RealTimePlot:
         shaft, hL, hR = parts
         pen = pg.mkPen(color, width=3)
         shaft.setPen(pen); hL.setPen(pen); hR.setPen(pen)
-        if length < 0.005:
+        if np.isnan(length) or length < 0.005:
             shaft.setData([], [])
             hL.setData([], []); hR.setData([], [])
             return
@@ -209,8 +217,7 @@ class RealTimePlot:
             p.getAxis('bottom').setHeight(28)
             _style_plot(p, pzt_n)
             setattr(self, f"p_pzt_{['fz','fx','fy'][r]}", p)
-            pc = 'r'
-            c = p.plot(pen=pg.mkPen(pc, width=3))
+            c = p.plot(pen=pg.mkPen('r', width=3))
             setattr(self, f"_c_pzt_{['fz','fx','fy'][r]}", c)
             t = pg.TextItem("", anchor=(1, 1))
             p.addItem(t)
@@ -226,11 +233,10 @@ class RealTimePlot:
             t2 = pg.TextItem("", anchor=(1, 1))
             p2.addItem(t2)
             setattr(self, f"_t_frc_{['fz','fx','fy'][r]}", t2)
-            # 红色文字：Fz=PZT_Fz, Fx/Fy=Cal
             t2r = pg.TextItem("", anchor=(1, 1))
             p2.addItem(t2r)
             setattr(self, f"_t_frc_{['fz','fx','fy'][r]}_r", t2r)
-            if r > 0:  # Fx/Fy have cal line
+            if r > 0:
                 c2c = p2.plot(pen=pg.mkPen('r', width=3, style=QtCore.Qt.DashLine))
                 setattr(self, f"_c_frc_{['fx','fy'][r-1]}_cal", c2c)
 
@@ -269,21 +275,21 @@ class RealTimePlot:
         self._mag_txt_frc = pg.TextItem("", anchor=(0, 1))
         self.p_mag.addItem(self._mag_txt_frc)
 
-        # --- 右列下方: Pressure Table + Gradient (row 1-3, col 2-3) ---
-        self.p_table = self.win.addPlot(row=1, col=2, rowspan=3, title="Pressure Table")
+        # --- 右列中部: Pressure Table + Gradient (row 1-2, col 2-3) ---
+        self.p_table = self.win.addPlot(row=1, col=2, rowspan=2, title="Pressure Table")
         self.p_table.hideAxis('left'); self.p_table.hideAxis('bottom')
         self.p_table.setAspectLocked(); self.p_table.invertY(True)
-        self.p_table.setXRange(-0.5, 12.5); self.p_table.setYRange(-0.5, 5.5)
+        self.p_table.setXRange(-0.5, 5.5); self.p_table.setYRange(-0.5, 12.5)
         self.p_table.getViewBox().setBackgroundColor('w')
         self.p_table.getViewBox().setBorder(pg.mkPen(width=0))
         # CellGridItem — 78 个独立色块 + 网格线（网格线在 paint() 中绘制）
-        self._cell_grid = CellGridItem(6, 13)
+        self._cell_grid = CellGridItem(13, 6)
         self.p_table.addItem(self._cell_grid)
         # 数值文字
         self._cell_txts = []
-        for r in range(6):
+        for r in range(13):
             row_t = []
-            for c in range(13):
+            for c in range(6):
                 t = pg.TextItem("", color='k', anchor=(0.5, 0.5))
                 self.p_table.addItem(t)
                 t.setPos(c, r)
@@ -294,13 +300,13 @@ class RealTimePlot:
         self.p_table.addItem(self._cop_dots)
         self._cop_arr, self._cop_hL, self._cop_hR = self._make_arrow_parts(self.p_table)
 
-        self.p_grad = self.win.addPlot(row=1, col=3, rowspan=3, title="Gradient Arrows")
+        self.p_grad = self.win.addPlot(row=1, col=3, rowspan=2, title="Gradient Arrows")
         self.p_grad.hideAxis('left'); self.p_grad.hideAxis('bottom')
         self.p_grad.setAspectLocked(); self.p_grad.invertY(True)
-        self.p_grad.setXRange(-0.5, 12.5); self.p_grad.setYRange(-0.5, 5.5)
+        self.p_grad.setXRange(-0.5, 5.5); self.p_grad.setYRange(-0.5, 12.5)
         self.p_grad.getViewBox().setBackgroundColor('w')
         self.p_grad.getViewBox().setBorder(pg.mkPen(width=0))
-        self._grid_lines = GridLinesItem(6, 13)
+        self._grid_lines = GridLinesItem(13, 6)
         self.p_grad.addItem(self._grid_lines)
         self._g_lines = []
         self._g_heads = []
@@ -318,13 +324,37 @@ class RealTimePlot:
         self._grad_cop_dots = pg.ScatterPlotItem()
         self.p_grad.addItem(self._grad_cop_dots)
 
+        # --- Hall传感器时间序列 2×2 嵌套布局 (row 3, col 2-3) ---
+        from pyqtgraph.Qt.QtWidgets import QGraphicsWidget, QGraphicsGridLayout
+        _hall_colors = {'x': 'r', 'y': 'g', 'z': 'b'}
+        _hall_container = QGraphicsWidget()
+        _hall_layout = QGraphicsGridLayout()
+        _hall_container.setLayout(_hall_layout)
+        _hall_layout.setSpacing(2)
+        for s in range(4):
+            r, c = divmod(s, 2)
+            p = pg.PlotItem(name=f"Hall{s}")
+            p.showGrid(x=True, y=True, alpha=0.3)
+            p.setTitle(f"Hall{s+1}", size='11pt', bold=True)
+            p.addLegend(offset=(10, 10))
+            setattr(self, f"p_hall{s}", p)
+            for axis in ['x', 'y', 'z']:
+                label = f'B{axis}'
+                curve = p.plot(pen=pg.mkPen(_hall_colors[axis], width=2), name=label)
+                setattr(self, f"_c_hall{s}_{axis}", curve)
+                t = pg.TextItem("", color=_hall_colors[axis], anchor=(1, 0))
+                p.addItem(t)
+                setattr(self, f"_t_hall{s}_{axis}", t)
+            _hall_layout.addItem(p, r, c)
+        self.win.ci.addItem(_hall_container, 3, 2, 1, 2)
 
-        # 强制左两列等宽
-        half_w = self.win.width() // 2 // 2
-        for r in range(3):
-            getattr(self, f"p_pzt_{['fz','fx','fy'][r]}").setPreferredWidth(half_w)
-            getattr(self, f"p_frc_{['fz','fx','fy'][r]}").setPreferredWidth(half_w)
-        self.p_err.setPreferredWidth(self.win.width() // 2)
+        # 所有4行等高，所有列等宽
+        layout = self.win.ci.layout
+        for r in range(4):
+            layout.setRowStretchFactor(r, 1)
+        for c in range(layout.columnCount()):
+            layout.setColumnStretchFactor(c, 1)
+
         self.win.show()
 
     # ===== 数据接口 =====
@@ -332,8 +362,8 @@ class RealTimePlot:
                  press_table_arr, total_press_val, force_total_mag,
                  cop_curr_x, cop_curr_y, cop_base_x, cop_base_y, cop_delta_x, cop_delta_y,
                  force_fx_val, force_fy_val, force_fz_val,
-                 cal_fx_val=None, cal_fy_val=None, cal_angle_deg=None, cal_mag_val=None,
-                 cop_state=0):
+                 cal_fx_val=None, cal_fy_val=None, cal_fz_val=None, cal_angle_deg=None, cal_mag_val=None,
+                 cop_state=0, hall_data=None):
         with self.lock:
             self._pzt_angle_deg = pzt_angle_deg
             self._pzt_mag_val = pzt_mag_val
@@ -352,13 +382,15 @@ class RealTimePlot:
             self._total_press_val = total_press_val
             self._cal_fx_val = cal_fx_val
             self._cal_fy_val = cal_fy_val
+            self._cal_fz_val = cal_fz_val
             self._cal_angle_deg = cal_angle_deg
             self._cal_mag_val = cal_mag_val
             self._cop_state = cop_state
 
-            angle_err = min(abs(pzt_angle_deg - force_angle_deg),
-                           360 - abs(pzt_angle_deg - force_angle_deg))
-            self.angle_error_history.append(angle_err)
+            if not np.isnan(force_angle_deg):
+                angle_err = min(abs(pzt_angle_deg - force_angle_deg),
+                               360 - abs(pzt_angle_deg - force_angle_deg))
+                self.angle_error_history.append(angle_err)
             self.adc_mag_history.append(pzt_mag_val)
             self.raw_force_mag_history.append(force_total_mag)
             self.pzt_fz_history.append(total_press_val)
@@ -370,13 +402,22 @@ class RealTimePlot:
             if cal_fx_val is not None:
                 self.force_fx_cal_history.append(cal_fx_val)
                 self.force_fy_cal_history.append(cal_fy_val)
+            if cal_fz_val is not None:
+                self.force_fz_cal_history.append(cal_fz_val)
+            if hall_data:
+                try:
+                    for s in range(4):
+                        for axis in ['x', 'y', 'z']:
+                            getattr(self, f'hall{s}_{axis}_history').append(hall_data[s][f'mag_{axis}'])
+                except Exception as e:
+                    print(f"⚠️ Hall set_data error: {e}, hall_data type={type(hall_data)}, len={len(hall_data) if hall_data else 0}")
 
     def append_full_data(self, rel_time_ms,
                           pzt_angle_deg, pzt_mag_val, total_press_val,
                           cop_delta_x_filt, cop_delta_y_filt,
                           force_angle_deg, force_mag_val,
                           force_fz_filt, force_fx_filt, force_fy_filt,
-                          cal_angle_deg=None, cal_mag_val=None, cal_fx_val=None, cal_fy_val=None):
+                          cal_angle_deg=None, cal_mag_val=None, cal_fx_val=None, cal_fy_val=None, cal_fz_val=None):
         with self.lock:
             self.full_time_list.append(rel_time_ms)
             self.full_adc_angle_list.append(pzt_angle_deg)
@@ -394,6 +435,7 @@ class RealTimePlot:
                 self.full_cal_mag_list.append(cal_mag_val)
                 self.full_fx_cal_list.append(cal_fx_val if cal_fx_val is not None else float('nan'))
                 self.full_fy_cal_list.append(cal_fy_val if cal_fy_val is not None else float('nan'))
+                self.full_fz_cal_list.append(cal_fz_val if cal_fz_val is not None else float('nan'))
 
     # ===== 更新 =====
     def update_all(self):
@@ -432,7 +474,10 @@ class RealTimePlot:
         # Direction: PZT=red + Force=blue
         fs = self._font_size(12)
         self._update_arrow(self._dir_pzt, pzt_angle_deg, 0.45, 'r')
-        self._update_arrow(self._dir_frc, _fa, 0.40, 'b')
+        if not np.isnan(_fa):
+            self._update_arrow(self._dir_frc, _fa, 0.40, 'b')
+        else:
+            self._update_arrow(self._dir_frc, 0, 0, 'b')
         self._dir_txt_pzt.setHtml(self._html(f'PZT_Angle: {pzt_angle_deg:.1f}°', 'red', fs))
         self._dir_txt_pzt.setPos(0.75, 1.15)
         self._dir_txt_frc.setHtml(self._html(f'Force_Angle: {_fa:.1f}°', 'blue', fs))
@@ -441,8 +486,11 @@ class RealTimePlot:
         # Magnitude: proportional length
         pzt_mag_len = max(min((pzt_mag_val / 5.0) * 0.65, 0.65), 0.01)
         self._update_arrow(self._mag_pzt, pzt_angle_deg, pzt_mag_len, 'r')
-        force_mag_len = max(min((abs(_fm) / 20.0) * 0.65, 0.65), 0.01)
-        self._update_arrow(self._mag_frc, _fa, force_mag_len, 'b')
+        if not np.isnan(_fm):
+            force_mag_len = max(min((abs(_fm) / 20.0) * 0.65, 0.65), 0.01)
+            self._update_arrow(self._mag_frc, _fa, force_mag_len, 'b')
+        else:
+            self._update_arrow(self._mag_frc, 0, 0, 'b')
         self._mag_txt_pzt.setHtml(self._html(f'PZT_Mag: {pzt_mag_val:.1f}', 'red', fs))
         self._mag_txt_pzt.setPos(0.35, 0.75)
         self._mag_txt_frc.setHtml(self._html(f'Force_Mag: {abs(_fm):.1f}', 'blue', fs))
@@ -469,8 +517,8 @@ class RealTimePlot:
         if COP.g_cop_contact_init_flag:
             cell_vmax = max(np.max(press_table_arr), self._heat_vmax)
             self._cell_grid.set_data(press_table_arr, cell_vmax)
-            for row_idx in range(6):
-                for col_idx in range(13):
+            for row_idx in range(13):
+                for col_idx in range(6):
                     cell_val = press_table_arr[row_idx, col_idx]
                     self._cell_txts[row_idx][col_idx].setText(f"{cell_val:.0f}" if cell_val > 0 else "")
             # CoP dots + arrow
@@ -493,7 +541,7 @@ class RealTimePlot:
                 grad_spots.append({'pos': (cop_base_x, cop_base_y), 'brush': 'b', 'symbol': 'x', 'size': 15})
             self._grad_cop_dots.setData(spots=grad_spots)
             for grad_idx, (grad_ln, grad_dot) in enumerate(zip(self._g_lines, self._g_heads)):
-                grad_row, grad_col = divmod(grad_idx, 7)
+                grad_row, grad_col = divmod(grad_idx, 6)
                 grad_x, grad_y = grad_arr[grad_row, grad_col, 0], grad_arr[grad_row, grad_col, 1]
                 grad_mag = np.hypot(grad_x, grad_y)
                 if grad_mag > 1.0:
@@ -511,9 +559,9 @@ class RealTimePlot:
                     self._g_txts[grad_idx].setText("")
         else:
             # CoP 未确定：清空两张表
-            self._cell_grid.set_data(np.zeros((6, 13)), 1.0)
-            for row_idx in range(6):
-                for col_idx in range(13):
+            self._cell_grid.set_data(np.zeros((13, 6)), 1.0)
+            for row_idx in range(13):
+                for col_idx in range(6):
                     self._cell_txts[row_idx][col_idx].setText("")
             self._cop_dots.setData(spots=[])
             self._cop_arr.setData([], [])
@@ -525,6 +573,37 @@ class RealTimePlot:
             for t in self._g_txts:
                 t.setText("")
             self._grad_cop_dots.setData(spots=[])
+
+        # Hall传感器曲线更新
+        for s in range(4):
+            try:
+                histories = {axis: list(getattr(self, f'hall{s}_{axis}_history')) for axis in ['x', 'y', 'z']}
+                has_data = any(len(h) > 0 for h in histories.values())
+                if has_data:
+                    all_vals = []
+                    for axis in ['x', 'y', 'z']:
+                        h = histories[axis]
+                        if h:
+                            xs = list(range(len(h)))
+                            getattr(self, f'_c_hall{s}_{axis}').setData(xs, h)
+                            all_vals.extend(h)
+                        else:
+                            getattr(self, f'_c_hall{s}_{axis}').setData([], [])
+                    all_vals = [v for v in all_vals if not np.isnan(v)]
+                    if all_vals:
+                        lo, hi = _yrange(all_vals)
+                        getattr(self, f'p_hall{s}').setXRange(0, max(len(histories['x']) - 1, 1))
+                        getattr(self, f'p_hall{s}').setYRange(lo, hi, padding=0)
+                        fs = self._font_size(12)
+                        _colors = {'x': 'red', 'y': 'green', 'z': 'blue'}
+                        for axis in ['x', 'y', 'z']:
+                            h = histories[axis]
+                            if h:
+                                txt = getattr(self, f'_t_hall{s}_{axis}')
+                                txt.setHtml(self._html(f'B{axis}={h[-1]:.1f}', _colors[axis], fs))
+                                txt.setPos(len(h) - 1 - 5, h[-1])
+            except Exception as e:
+                print(f"⚠️ Hall{s} update error: {e}")
 
         # FPS
     @staticmethod

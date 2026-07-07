@@ -48,7 +48,7 @@ CSV_DIR = "/home/qcy/Project/data/2.PZT_tangential/weight/test"
 #   关键词
 #     "latest:N" → 最新的 N 个文件
 #     "all"      → 全部文件
-CSV_PICK = "data_20260608_123920.csv"
+CSV_PICK = "COP_0610_2.csv"
 
 # valid 分段显示：True=valid!=0 深色粗线(valid=0 浅色淡化)，False=统一普通样式
 HIGHLIGHT_VALID = True
@@ -104,7 +104,7 @@ _COLUMN_NAMES = [
     "delta_Force_X", "delta_Force_Y", "delta_Force_Z",
     "ADC_angle", "ADC_mag", "Force_angle", "Force_mag",
     "Fx_cal", "Fy_cal", "Force_cal_mag", "Force_cal_angle",
-    "CoP_state", "valid",
+    "CoP_state",
 ]
 
 _NAME_TO_IDX = {name: idx for idx, name in enumerate(_COLUMN_NAMES)}

@@ -16,13 +16,16 @@ import calibrate
 import importlib
 
 # ===================== 配置 =====================
-MAIN_REALTIME_MODULE = "realtime"           # "realtime"=全显示, "realtime2"=仅压阻
-MAIN_SAVE_DIR = "/home/qcy/Project/data/2.PZT_tangential/weight/test"  # 数据保存根目录
-MAIN_CAL_MODE = "discrete"                       # "lookup"=最近邻查表, "discrete"=双线性插值, "fit"=拟合, "auto"=优先拟合回退查表
-MAIN_CAL_DIM = "2D"                            # "2D"=仅切向力(Fx,Fy), "3D"=三维力(Fz,Fx,Fy)
+MAIN_REALTIME_MODULE = "realtime"                  # "realtime"=全显示, "realtime2"=仅压阻
+MAIN_SAVE_DIR = "/home/qcy/Project/data/MAG/test"  # 数据保存根目录
+MAIN_CAL_MODE = "fit"                         # "lookup"=最近邻查表, "discrete"=双线性插值, "fit"=拟合, "auto"=优先拟合回退查表
+MAIN_CAL_DIM = "2D"                                # "2D"=仅切向力(Fx,Fy), "3D"=三维力(Fz,Fx,Fy)
+MAIN_REFINE_REZERO_FORCE = True             # True=COP二次精修后重新置零六维力
+fit_coefs_path = "/home/qcy/Project/data/2.PZT_tangential/weight/png/fit_coefs.bin"  # fit模型路径
 
 realtime = importlib.import_module(MAIN_REALTIME_MODULE)
-MAIN_TARGET_FPS = 100                      # 目标采集帧率
+MAIN_TARGET_FPS = 100                      # 目标采集帧率(主循环)
+MAIN_READ_INTERVAL_S = 0.01                # 采集线程读取间隔(秒)，0.001=1000Hz, 0.01=100Hz, 0.1=10Hz
 MAIN_MAX_TIME_DIFF_S = 0.015               # 压力-力传感器最大时间匹配差(秒)
 g_main_stop_flag = threading.Event()       # 全局停止信号
 g_main_plot = None                         # 绘图对象引用
@@ -44,7 +47,7 @@ class PressureThread(threading.Thread):
                     self.buf.append({"t":ts,"data":d,"hall":hall})
                 except:
                     pass
-            time.sleep(0.001)
+            time.sleep(MAIN_READ_INTERVAL_S)
 
 class ForceThread(threading.Thread):
     def __init__(self, sensor, buf):
@@ -69,6 +72,9 @@ def data_loop():
 
     has_press = True          # 是否有压力传感器
     has_force = True           # 是否有六维力传感器
+
+    if MAIN_CAL_MODE == "fit":
+        import fit
 
     try:
         sensor_press = data.PressureSensor()
@@ -100,14 +106,14 @@ def data_loop():
     print("🎨 绘图已打开")
     start_time_s = time.perf_counter()
 
-    # 加载标定模型（查找表 + 拟合）
+    # 加载标定模型（查找表 + fit）
     cal_bin_path = os.path.join(MAIN_SAVE_DIR, "cal_lookup.bin")
-    cal_fit_path = os.path.join(MAIN_SAVE_DIR, "cal_fit.bin")
     cal_lut_ready_flag = False
-    cal_fit_ready_flag = False
     cal_pts_arr = cal_fz_arr = cal_fx_arr = cal_fy_arr = None
-    cal_coefs = None
     disc_dx_grid = disc_dy_grid = disc_fx_grid = disc_fy_grid = None
+    fit_type = None
+    fit_params_list = None
+    fit_split_sign = False
     if os.path.exists(cal_bin_path):
         try:
             if MAIN_CAL_DIM == "3D":
@@ -121,15 +127,68 @@ def data_loop():
             print(f"📐 查找表已加载: {cal_bin_path}")
         except Exception as e:
             print(f"⚠️ 查找表加载失败: {e}")
-    if os.path.exists(cal_fit_path):
+    if MAIN_CAL_MODE == "fit" and os.path.exists(fit_coefs_path):
         try:
-            cal_coefs = calibrate.load_fit_model(cal_fit_path, dim=MAIN_CAL_DIM)
-            cal_fit_ready_flag = True
-            print(f"📐 拟合模型已加载: {cal_fit_path}")
+            fit_type, _, fit_params_list, fit_split_sign = fit.load_coefs(fit_coefs_path)
+            type_summary = ", ".join(f"{p[1]}{'(split)' if p[2] else ''}" for p in fit_params_list)
+            print(f"📐 fit模型已加载: {fit_coefs_path} (outputs: {type_summary})")
         except Exception as e:
-            print(f"⚠️ 拟合模型加载失败: {e}")
-    if not cal_lut_ready_flag and not cal_fit_ready_flag:
+            print(f"⚠️ fit模型加载失败: {e}")
+            fit_split_sign = False
+    if not cal_lut_ready_flag and fit_params_list is None:
         print("💡 未找到标定文件")
+
+    # ==================== 标定引擎（fit 引擎 vs calibrate 引擎） ====================
+    def _calibrate_select_engine():
+        """选择标定引擎：fit / calibrate / None
+        决策树：MAIN_CAL_MODE → 模型就绪状态 → fit_params_list 优先级
+        """
+        if MAIN_CAL_MODE == "fit":
+            if fit_params_list is not None:        return "fit"
+            if cal_lut_ready_flag:                 return "calibrate"
+            return None
+        if MAIN_CAL_MODE == "lookup":
+            return "calibrate" if cal_lut_ready_flag else None
+        if MAIN_CAL_MODE == "discrete":
+            return "calibrate" if cal_lut_ready_flag else None
+        if MAIN_CAL_MODE == "auto":
+            if fit_params_list is not None:        return "fit"
+            if cal_lut_ready_flag:                 return "calibrate"
+            return None
+        return None
+
+    def _calibrate_apply(engine, dim, total_press, dx, dy):
+        """根据引擎执行标定，返回 (fx, fy, fz)"""
+        if engine == "fit":
+            # === fit 引擎（fit.py 7 种非线性模型）===
+            if dim == "3D":
+                x_inputs = [dx, dy, total_press]
+                results = fit.apply_predict_multi(x_inputs, fit_params_list, fit_type, fit_split_sign)
+                if len(results) >= 3: return results[0], results[1], results[2]
+                if len(results) >= 2: return results[0], results[1], None
+                return None, None, None
+            x_inputs = [dx, dy]
+            results = fit.apply_predict_multi(x_inputs, fit_params_list, fit_type, fit_split_sign)
+            if len(results) >= 2: return results[0], results[1], None
+            return None, None, None
+
+        if engine == "calibrate":
+            # === calibrate 引擎（calibrate.py 仅 lookup + discrete）===
+            if dim == "3D":
+                query = [total_press, dx, dy]
+                if MAIN_CAL_MODE == "lookup":
+                    return calibrate.apply(query, cal_pts_arr, cal_fx_arr, cal_fy_arr, fz_vals=cal_fz_arr)
+                if MAIN_CAL_MODE == "discrete":
+                    fx, fy = calibrate.apply_discrete(dx, dy, disc_dx_grid, disc_dy_grid, disc_fx_grid, disc_fy_grid)
+                    return fx, fy, None
+            else:  # 2D
+                query = [dx, dy]
+                if MAIN_CAL_MODE == "lookup":
+                    return calibrate.apply(query, cal_pts_arr, cal_fx_arr, cal_fy_arr) + (None,)
+                if MAIN_CAL_MODE == "discrete":
+                    return calibrate.apply_discrete(dx, dy, disc_dx_grid, disc_dy_grid, disc_fx_grid, disc_fy_grid) + (None,)
+
+        return None, None, None
 
     median_filt_window = 5
     buf_cop_delta_x = deque(maxlen=median_filt_window)
@@ -139,6 +198,8 @@ def data_loop():
     buf_force_fz = deque(maxlen=median_filt_window)
 
     _NAN6 = [float('nan')] * 6  # 力传感器占位
+    _prev_refined = False       # COP精修状态（用于检测跳变）
+    _prev_contact = False       # COP接触状态（用于检测力卸载）
 
     while not g_main_stop_flag.is_set():
         loop_start_s = time.perf_counter()
@@ -153,6 +214,7 @@ def data_loop():
             continue
 
         # ---- 计算 PZT / CoP ----
+        hall_data = press_item.get("hall") if press_item is not None else None
         if press_item is not None:
             cop_res = COP.compute_pressure_direction(press_item["data"])
             base_sub_arr = np.array(press_item["data"])
@@ -161,6 +223,41 @@ def data_loop():
             cop_base_x, cop_base_y = cop_res[8], cop_res[9]
             cop_state = cop_res[10]
             total_press_val = np.sum(press_item["data"])
+
+            # COP精修完成后重新归零 Fx/Fy（Fz不变，10帧平均）
+            if MAIN_REFINE_REZERO_FORCE and has_force:
+                if COP.g_cop_post_refined_flag and not _prev_refined:
+                    def _rezero():
+                        vals = []
+                        for _ in range(10):
+                            d = sensor_force.read()
+                            if d:
+                                vals.append(d)
+                            time.sleep(0.001)
+                        if vals:
+                            avg = np.mean(vals, axis=0)
+                            sensor_force.zero_data[0] += avg[0]
+                            sensor_force.zero_data[1] += avg[1]
+                            print("🔄 COP精修完成，Fx/Fy已归零")
+                    threading.Thread(target=_rezero, daemon=True).start()
+            _prev_refined = COP.g_cop_post_refined_flag
+
+            # 力卸载后COP重置 → 六维力归零
+            if has_force and _prev_contact and not COP.g_cop_contact_init_flag:
+                def _rezero_unload():
+                    vals = []
+                    for _ in range(10):
+                        d = sensor_force.read()
+                        if d:
+                            vals.append(d)
+                        time.sleep(0.001)
+                    if vals:
+                        avg = np.mean(vals, axis=0)
+                        sensor_force.zero_data[0] += avg[0]
+                        sensor_force.zero_data[1] += avg[1]
+                        print("🔄 力卸载，Fx/Fy已归零")
+                threading.Thread(target=_rezero_unload, daemon=True).start()
+            _prev_contact = COP.g_cop_contact_init_flag
 
             buf_cop_delta_x.append(cop_delta_x)
             buf_cop_delta_y.append(cop_delta_y)
@@ -195,43 +292,14 @@ def data_loop():
             force_ts_out = float('nan')
 
         # ---- 标定 ----
-        cal_fx_val = cal_fy_val = cal_angle_deg = cal_mag_val = None
+        cal_fx_val = cal_fy_val = cal_fz_val = cal_angle_deg = cal_mag_val = None
         if press_item is not None:
-            do_fit = MAIN_CAL_MODE == "fit" and cal_fit_ready_flag
-            do_lut = MAIN_CAL_MODE == "lookup" and cal_lut_ready_flag
-            do_discrete = MAIN_CAL_MODE == "discrete" and cal_lut_ready_flag
-            do_auto = MAIN_CAL_MODE == "auto"
-
-            if MAIN_CAL_DIM == "3D":
-                query = [total_press_val, cop_delta_x_filt, cop_delta_y_filt]
-                if do_fit:
-                    cal_fz_val, cal_fx_val, cal_fy_val = calibrate.apply_fit(query, cal_coefs, dim="3D")
-                elif do_lut:
-                    cal_fz_val, cal_fx_val, cal_fy_val = calibrate.apply(query, cal_pts_arr, cal_fx_arr, cal_fy_arr, fz_vals=cal_fz_arr)
-                elif do_discrete:
-                    cal_fx_val, cal_fy_val = calibrate.apply_discrete(cop_delta_x_filt, cop_delta_y_filt, disc_dx_grid, disc_dy_grid, disc_fx_grid, disc_fy_grid)
-                elif do_auto:
-                    if cal_fit_ready_flag:
-                        cal_fz_val, cal_fx_val, cal_fy_val = calibrate.apply_fit(query, cal_coefs, dim="3D")
-                    elif cal_lut_ready_flag:
-                        cal_fz_val, cal_fx_val, cal_fy_val = calibrate.apply(query, cal_pts_arr, cal_fx_arr, cal_fy_arr, fz_vals=cal_fz_arr)
-                if cal_fx_val is not None:
-                    cal_angle_deg, cal_mag_val = angle.compute_vector_angle(cal_fx_val, cal_fy_val)
-            else:
-                query = [cop_delta_x_filt, cop_delta_y_filt]
-                if do_fit:
-                    cal_fx_val, cal_fy_val = calibrate.apply_fit(query, cal_coefs, dim="2D")
-                elif do_lut:
-                    cal_fx_val, cal_fy_val = calibrate.apply(query, cal_pts_arr, cal_fx_arr, cal_fy_arr)
-                elif do_discrete:
-                    cal_fx_val, cal_fy_val = calibrate.apply_discrete(cop_delta_x_filt, cop_delta_y_filt, disc_dx_grid, disc_dy_grid, disc_fx_grid, disc_fy_grid)
-                elif do_auto:
-                    if cal_fit_ready_flag:
-                        cal_fx_val, cal_fy_val = calibrate.apply_fit(query, cal_coefs, dim="2D")
-                    elif cal_lut_ready_flag:
-                        cal_fx_val, cal_fy_val = calibrate.apply(query, cal_pts_arr, cal_fx_arr, cal_fy_arr)
-                if cal_fx_val is not None:
-                    cal_angle_deg, cal_mag_val = angle.compute_vector_angle(cal_fx_val, cal_fy_val)
+            engine = _calibrate_select_engine()
+            if engine is not None:
+                cal_fx_val, cal_fy_val, cal_fz_val = _calibrate_apply(
+                    engine, MAIN_CAL_DIM, total_press_val, cop_delta_x_filt, cop_delta_y_filt)
+            if cal_fx_val is not None:
+                cal_angle_deg, cal_mag_val = angle.compute_vector_angle(cal_fx_val, cal_fy_val)
 
         # ---- CSV ----
         press_ts = press_item["t"] if press_item is not None else float('nan')
@@ -268,9 +336,13 @@ def data_loop():
             cop_curr_x, cop_curr_y, cop_base_x, cop_base_y,
             cop_delta_x_filt, cop_delta_y_filt,
             force_fx_filt, force_fy_filt, force_fz_filt,
-            cal_fx_val, cal_fy_val, cal_angle_deg, cal_mag_val,
-            cop_state=cop_state,
+            cal_fx_val, cal_fy_val, cal_fz_val, cal_angle_deg, cal_mag_val,
+            cop_state=cop_state, hall_data=hall_data,
         )
+        # [DEBUG] Hall数据状态 — 每秒打印一次
+        if rel_time_ms % 1000 < int(1000 / MAIN_TARGET_FPS):
+            _hd = hall_data[0] if hall_data else None
+            print(f"[DEBUG] t={rel_time_ms}ms | press_item={'Y' if press_item else 'N'} | hall_data={'Y' if hall_data else 'N'} | hall1={_hd}")
         if COP.g_cop_contact_init_flag:
             g_main_plot.append_full_data(
                 rel_time_ms,
@@ -278,7 +350,7 @@ def data_loop():
                 cop_delta_x_filt, cop_delta_y_filt,
                 force_angle_deg, force_mag_val,
                 force_fz_filt, force_fx_filt, force_fy_filt,
-                cal_angle_deg, cal_mag_val, cal_fx_val, cal_fy_val)
+                cal_angle_deg, cal_mag_val, cal_fx_val, cal_fy_val, cal_fz_val)
 
         elapsed = time.perf_counter() - loop_start_s
         time.sleep(max(0, 1/MAIN_TARGET_FPS - elapsed))
