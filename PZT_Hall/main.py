@@ -14,13 +14,15 @@ import data as data
 import table as table
 import calibrate
 import importlib
+import queue
+from threading import Lock
 
 # ===================== 配置 =====================
 MAIN_REALTIME_MODULE = "realtime"                  # "realtime"=全显示, "realtime2"=仅压阻
 MAIN_SAVE_DIR = "/home/qcy/Project/data/MAG/test"  # 数据保存根目录
-MAIN_CAL_MODE = "fit"                         # "lookup"=最近邻查表, "discrete"=双线性插值, "fit"=拟合, "auto"=优先拟合回退查表
+MAIN_CAL_MODE = "fit"                              # "lookup"=最近邻查表, "discrete"=双线性插值, "fit"=拟合, "auto"=优先拟合回退查表
 MAIN_CAL_DIM = "2D"                                # "2D"=仅切向力(Fx,Fy), "3D"=三维力(Fz,Fx,Fy)
-MAIN_REFINE_REZERO_FORCE = True             # True=COP二次精修后重新置零六维力
+MAIN_REFINE_REZERO_FORCE = True                    # True=COP二次精修后重新置零六维力
 fit_coefs_path = "/home/qcy/Project/data/2.PZT_tangential/weight/png/fit_coefs.bin"  # fit模型路径
 
 realtime = importlib.import_module(MAIN_REALTIME_MODULE)
@@ -32,10 +34,11 @@ g_main_plot = None                         # 绘图对象引用
 
 # ===================== 采集线程 =====================
 class PressureThread(threading.Thread):                   
-    def __init__(self, sensor, buf):                      
+    def __init__(self, sensor, buf, q: queue.Queue):                      
         super().__init__(daemon=True)
         self.s = sensor                                   
         self.buf = buf
+        self.q = q
     def run(self):
         while not g_main_stop_flag.is_set():
             ts = time.perf_counter()
@@ -44,7 +47,8 @@ class PressureThread(threading.Thread):
             if raw:
                 try:
                     d, hall = self.s.decode(raw)
-                    self.buf.append({"t":ts,"data":d,"hall":hall})
+                    # self.buf.append({"t":ts,"data":d,"hall":hall})
+                    self.q.put({"t":ts,"data":d,"hall":hall})
                 except:
                     pass
             time.sleep(MAIN_READ_INTERVAL_S)
@@ -73,13 +77,15 @@ def data_loop():
     has_press = True          # 是否有压力传感器
     has_force = True           # 是否有六维力传感器
 
+    pressure_packet_queue = queue.Queue(32)
+
     if MAIN_CAL_MODE == "fit":
         import fit
 
     try:
         sensor_press = data.PressureSensor()
         buf_press = data.TimestampedBuffer(500)
-        thread_press = PressureThread(sensor_press, buf_press)
+        thread_press = PressureThread(sensor_press, buf_press, pressure_packet_queue)
         thread_press.start()
         print("✅ 压力传感器就绪")
     except Exception as e:
@@ -206,7 +212,12 @@ def data_loop():
         rel_time_ms = int((loop_start_s - start_time_s) * 1000)
 
         # ---- 采集压力数据 ----
-        press_item = buf_press.get_latest() if has_press else None
+        # press_item = buf_press.get_latest() if has_press else None
+        if not pressure_packet_queue.empty():
+            press_item = pressure_packet_queue.get(block=False)
+            print(press_item)
+        else:
+            continue
         force_item = buf_force.get_latest() if has_force else None
 
         if press_item is None and force_item is None:
