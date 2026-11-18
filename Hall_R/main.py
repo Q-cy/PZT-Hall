@@ -7,7 +7,7 @@ from tactile_sensor import TactileSensor
 def main():
     tactile_sensor = TactileSensor() # 实例化对象，会运行TactileSensor.__init__()
 
-    try:                            # try 代码块内会进行异常捕获，捕获异常后执行 except，finally无论如何都会执行
+    try:                            # try 代码块内会进行异常捕获，捕获异常后执行 except，finally 无论如何都会执行
         while True:
             raw = tactile_sensor.read_data()
 

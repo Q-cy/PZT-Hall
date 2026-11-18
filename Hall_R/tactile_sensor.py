@@ -328,7 +328,7 @@ class TactileSensor:
             received_data = self.serial.read(waiting_bytes)
 
             if received_data:
-                with self._buffer_lock:             # with是Python的“上下文管理”语句，用于保证某种资源在使用后自动释放
+                with self._buffer_lock:             # with 是 Python 的“上下文管理”语句，用于保证某种资源在使用后自动释放
                     self._rx_buffer.extend(received_data)
                     self._parse_response_buffer()
 
@@ -390,6 +390,15 @@ class TactileSensor:
             del self._rx_buffer[
                 :self.response_protocol.RESPONSE_FRAME_LEN
             ]
+
+    def read_data(self):
+        """取出最早一帧已经校验通过的188B传感器负载"""
+
+        with self._buffer_lock:
+            if not self._frame_buffer:
+                return None
+
+            return self._frame_buffer.popleft()     # 从 deque 最左边取出一个元素，并同时从队列中删除它
 
     def close(self):
 
