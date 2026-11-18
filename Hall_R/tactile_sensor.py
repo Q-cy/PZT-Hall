@@ -271,6 +271,7 @@ class TactileSensor:
 
         self._request_thread = None
         self._response_thread = None
+        self._start_time_ns = None
         self.last_error = None
 
         self.open_port()
@@ -297,6 +298,8 @@ class TactileSensor:
         if self._running.is_set():                      
             return                           
 
+        # 记录采集启动时刻，后续时间戳从0ms开始
+        self._start_time_ns = time.perf_counter_ns()
         self._running.set()                          # 打开开关
         self._request_thread = threading.Thread(     # 创建线程对象
             target = self._request_loop,             # 加括号表示现在立即执行函数, 不加括号表示把“函数本身”交给线程
@@ -383,8 +386,11 @@ class TactileSensor:
                 del self._rx_buffer[:1]
                 continue
 
-            # 保存已经通过全部协议校验的传感器负载
-            self._frame_buffer.append(response_payload)
+            # 在读取线程确认完整合法帧时生成从0开始的毫秒时间戳
+            timestamp_ms = (time.perf_counter_ns() - self._start_time_ns) / 1_000_000.0
+
+            # 将接收时间戳和传感器负载作为同一帧保存
+            self._frame_buffer.append((timestamp_ms,response_payload))
 
             # 删除已经处理的完整回复帧，继续检查后面是否还有粘包
             del self._rx_buffer[
@@ -392,7 +398,7 @@ class TactileSensor:
             ]
 
     def read_data(self):
-        """取出最早一帧已经校验通过的188B传感器负载"""
+        """返回(timestamp_ms, 188B传感器负载)，无数据时返回None"""
 
         with self._buffer_lock:
             if not self._frame_buffer:
