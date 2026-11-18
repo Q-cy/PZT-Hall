@@ -248,6 +248,50 @@ class RESPONSE_PROTOCOL:
 
         return response_payload
 
+    def decode_payload(self, response_payload):
+        """将188B负载解码为压阻数据和Hall原始数据"""
+
+        if not isinstance(response_payload, bytes):
+            raise TypeError(
+                "response_payload must be bytes"
+            )
+
+        if len(response_payload) != RESPONSE_PAYLOAD_LEN:
+            raise ValueError(
+                f"payload len error："
+                f"received {len(response_payload)}bytes，"
+                f"should be {RESPONSE_PAYLOAD_LEN}bytes"
+            )
+
+        # 前156B为78路小端uint16压阻数据
+        piezoresistance_payload = response_payload[
+            :PIEZORESISTANCE_PAYLOAD_LEN
+        ]
+
+        piezoresistance_data = list(
+            struct.unpack(
+                f"<{PIEZORESISTANCE_CELL_COUNT}H",
+                piezoresistance_payload,
+            )
+        )
+
+        # 后32B为4个Hall块，暂时只按每块8B切分
+        hall_payload = response_payload[
+            PIEZORESISTANCE_PAYLOAD_LEN:
+        ]
+
+        hall_data = []
+
+        for hall_index in range(HALL_SENSOR_COUNT):
+            hall_start = hall_index * HALL_SENSOR_LEN
+            hall_end = hall_start + HALL_SENSOR_LEN
+
+            hall_data.append(
+                hall_payload[hall_start:hall_end]
+            )
+
+        return piezoresistance_data, hall_data
+
 
 # ==================== UART control ====================
 class TactileSensor:
@@ -405,6 +449,13 @@ class TactileSensor:
                 return None
 
             return self._frame_buffer.popleft()     # 从 deque 最左边取出一个元素，并同时从队列中删除它
+
+    def decode(self, response_payload):
+        """返回(压阻数据列表, Hall原始数据列表)"""
+
+        return self.response_protocol.decode_payload(
+            response_payload
+        )
 
     def close(self):
 
