@@ -4,11 +4,53 @@
 
 import time
 
-from tactile_sensor import TactileSensor
+from tactile_sensor import (
+    PIEZORESISTANCE_COLS,
+    PIEZORESISTANCE_ROWS,
+    TactileSensor,
+)
+
+
+PIEZORESISTANCE_VALUE_WIDTH = 5
+
+
+def format_piezoresistance(piezoresistance_data):
+    """按照Sensor Config的行列数格式化固定列宽压力矩阵"""
+
+    expected_count = (
+        PIEZORESISTANCE_ROWS
+        * PIEZORESISTANCE_COLS
+    )
+
+    if len(piezoresistance_data) != expected_count:
+        raise ValueError(
+            f"piezoresistance count error: "
+            f"received {len(piezoresistance_data)}, "
+            f"should be {expected_count}"
+        )
+
+    matrix_lines = []
+
+    for row_index in range(PIEZORESISTANCE_ROWS):
+        row_start = row_index * PIEZORESISTANCE_COLS
+        row_end = row_start + PIEZORESISTANCE_COLS
+        row_data = piezoresistance_data[row_start:row_end]
+
+        matrix_lines.append(
+            " ".join(
+                f"{value:{PIEZORESISTANCE_VALUE_WIDTH}d}"
+                for value in row_data
+            )
+        )
+
+    return "\n".join(matrix_lines)
 
 
 def main():
     tactile_sensor = TactileSensor() # 实例化对象，会运行TactileSensor.__init__()
+    frame_count = 0
+    print_window_start_ms = None
+    print_window_frame_count = 0
 
     try:                            # try 代码块内会进行异常捕获，捕获异常后执行 except，finally 无论如何都会执行
         while True:
@@ -19,24 +61,42 @@ def main():
                 continue
 
             timestamp_ms, response_payload = sensor_packet
+            frame_count += 1
+            print_window_frame_count += 1
+
+            if print_window_start_ms is None:
+                print_window_start_ms = timestamp_ms
+
+            print_window_elapsed_ms = (
+                timestamp_ms - print_window_start_ms
+            )
+
+            # 主循环继续逐帧取数据，但终端每约1秒只打印一次
+            if print_window_elapsed_ms < 1000.0:
+                continue
+
+            frame_rate = (
+                print_window_frame_count
+                * 1000.0
+                / print_window_elapsed_ms
+            )
 
             piezoresistance_data, hall_data = tactile_sensor.decode(
                 response_payload
             )
 
             print(
+                f"frame: {frame_count} | "
                 f"timestamp: {timestamp_ms:.3f} ms | "
+                f"fps: {frame_rate:.1f} | "
                 f"payload: {len(response_payload)} bytes"
             )
 
+            print("piezoresistance:")
             print(
-                "raw payload:",
-                response_payload.hex(" "),
-            )
-
-            print(
-                "piezoresistance:",
-                piezoresistance_data,
+                format_piezoresistance(
+                    piezoresistance_data
+                )
             )
 
             for hall_index, hall_raw in enumerate(
@@ -47,6 +107,9 @@ def main():
                     f"hall {hall_index}:",
                     hall_raw.hex(" "),
                 )
+
+            print_window_start_ms = timestamp_ms
+            print_window_frame_count = 0
 
     except KeyboardInterrupt:
         print("\nstop received")
