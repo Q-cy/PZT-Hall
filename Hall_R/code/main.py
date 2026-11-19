@@ -2,16 +2,29 @@
 主函数
 """
 
+import csv
+import os
 import time
 
 from tactile_sensor import (
     PIEZORESISTANCE_COLS,
     PIEZORESISTANCE_ROWS,
     TactileSensor,
+    build_csv_header,
+    make_csv_row,
 )
 
 
 PIEZORESISTANCE_VALUE_WIDTH = 5
+
+# CSV输出目录：Hall_R/data，基于脚本位置解析，不依赖运行时工作目录
+DATA_DIR = os.path.normpath(
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "data",
+    )
+)
 
 
 def format_piezoresistance(piezoresistance_data):
@@ -49,7 +62,18 @@ def format_piezoresistance(piezoresistance_data):
 def main():
     tactile_sensor = TactileSensor() # 实例化对象，会运行TactileSensor.__init__()
     latest_timestamp_ms = None
-    latest_response_payload = None
+    latest_piezoresistance_data = None
+    latest_hall_data = None
+    latest_payload_len = None
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    csv_filename = os.path.join(
+        DATA_DIR,
+        time.strftime("tactile_data_%Y%m%d_%H%M%S.csv"),
+    )
+    csv_file = open(csv_filename, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(build_csv_header())
 
     print_window_start_time = time.monotonic()
     previous_status = tactile_sensor.get_status()
@@ -63,16 +87,26 @@ def main():
         "request frame:",
         tactile_sensor.request_protocol.request_frame.hex(" ")
     )
+    print(f"csv file: {csv_filename}")
 
     try:                            # try 代码块内会进行异常捕获，捕获异常后执行 except，finally 无论如何都会执行
         while True:
             sensor_packet = tactile_sensor.read_data()
 
             if sensor_packet is not None:
-                (
+                latest_timestamp_ms, response_payload = sensor_packet
+
+                latest_payload_len = len(response_payload)
+
+                latest_piezoresistance_data, latest_hall_data = (
+                    tactile_sensor.decode(response_payload)
+                )
+
+                csv_writer.writerow(make_csv_row(
                     latest_timestamp_ms,
-                    latest_response_payload,
-                ) = sensor_packet
+                    latest_piezoresistance_data,
+                    latest_hall_data,
+                ))
 
             current_time = time.monotonic()
             print_window_elapsed_s = (
@@ -167,15 +201,21 @@ def main():
             else:
                 active_problem = None
 
-            piezoresistance_data, hall_data = tactile_sensor.decode(
-                latest_response_payload
-            )
+            if latest_piezoresistance_data is None:
+                # 竞态窗口：统计显示有有效帧，但主循环尚未取到帧数据
+                active_problem = None
+                previous_status = status
+                print_window_start_time = current_time
+                continue
+
+            piezoresistance_data = latest_piezoresistance_data
+            hall_data = latest_hall_data
 
             print(
                 f"frame: {status['valid_frame_count']} | "
                 f"timestamp: {latest_timestamp_ms:.3f} ms | "
                 f"fps: {frame_rate:.1f} | "
-                f"payload: {len(latest_response_payload)} bytes | "
+                f"payload: {latest_payload_len} bytes | "
                 f"queued: {status['queued_frame_count']}"
             )
 
@@ -203,6 +243,8 @@ def main():
                     f"{hall_sensor['magnetic_magnitude_gauss']:10.3f}"
                 )
 
+            csv_file.flush()
+
             previous_status = status
             print_window_start_time = current_time
 
@@ -210,6 +252,7 @@ def main():
         print("\nstop received")
 
     finally:
+        csv_file.close()
         tactile_sensor.close()
 
 

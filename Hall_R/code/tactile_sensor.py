@@ -373,6 +373,52 @@ class RESPONSE_PROTOCOL:
         return piezoresistance_data, hall_data
 
 
+# ==================== CSV Export ====================
+
+def build_csv_header():
+    """生成99列CSV表头：时间戳 + 78路压阻 + 4个Hall传感器物理量"""
+
+    header = ["timestamp_ms"]
+
+    for channel_index in range(
+        PIEZORESISTANCE_ROWS * PIEZORESISTANCE_COLS
+    ):
+        header.append(f"ch{channel_index + 1}")
+
+    for hall_index in range(1, HALL_SENSOR_COUNT + 1):
+        header.extend([
+            f"h{hall_index}_t",
+            f"h{hall_index}_bx",
+            f"h{hall_index}_by",
+            f"h{hall_index}_bz",
+            f"h{hall_index}_mag",
+        ])
+
+    return header
+
+
+def make_csv_row(timestamp_ms, piezoresistance_data, hall_data):
+    """将decode_payload的一帧解码数据组装为与表头顺序一致的CSV行"""
+
+    row = [f"{timestamp_ms:.3f}"]
+
+    row.extend(
+        str(value)
+        for value in piezoresistance_data
+    )
+
+    for hall_sensor in hall_data:
+        row.extend([
+            f"{hall_sensor['temperature_c']:.4f}",
+            f"{hall_sensor['magnetic_x_gauss']:.4f}",
+            f"{hall_sensor['magnetic_y_gauss']:.4f}",
+            f"{hall_sensor['magnetic_z_gauss']:.4f}",
+            f"{hall_sensor['magnetic_magnitude_gauss']:.4f}",
+        ])
+
+    return row
+
+
 # ==================== UART control ====================
 class TactileSensor:
     def __init__(
