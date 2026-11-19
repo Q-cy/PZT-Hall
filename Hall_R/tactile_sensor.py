@@ -24,6 +24,13 @@ PIEZORESISTANCE_COLS = 6
 HALL_SENSOR_COUNT = 4
 HALL_SENSOR_LEN = 8
 
+HALL_DATA_FORMAT = "<hhhh"
+HALL_TEMPERATURE_REFERENCE_C = 25.0
+HALL_TEMPERATURE_REFERENCE_RAW = 17512
+HALL_TEMPERATURE_LSB_PER_C = 58.2
+HALL_MAGNETIC_LSB_PER_MT = 885.0
+HALL_GAUSS_PER_MT = 10.0
+
 
 # ==================== Protocol Config====================
 PIEZORESISTANCE_CELL_COUNT = PIEZORESISTANCE_ROWS * PIEZORESISTANCE_COLS
@@ -36,6 +43,7 @@ RESPONSE_PAYLOAD_LEN = PIEZORESISTANCE_PAYLOAD_LEN + HALL_PAYLOAD_LEN
 assert PIEZORESISTANCE_ROWS > 0
 assert PIEZORESISTANCE_COLS > 0
 assert HALL_SENSOR_COUNT >= 0
+assert HALL_SENSOR_LEN == struct.calcsize(HALL_DATA_FORMAT)
 assert 0 < RESPONSE_PAYLOAD_LEN <= 0xFFFF
 
 
@@ -248,8 +256,76 @@ class RESPONSE_PROTOCOL:
 
         return response_payload
 
+    def decode_hall_block(self, hall_raw):
+        """将一个8B Hall块解码为温度和三轴磁场"""
+
+        if not isinstance(hall_raw, bytes):
+            raise TypeError(
+                "hall_raw must be bytes"
+            )
+
+        if len(hall_raw) != HALL_SENSOR_LEN:
+            raise ValueError(
+                f"hall len error："
+                f"received {len(hall_raw)}bytes，"
+                f"should be {HALL_SENSOR_LEN}bytes"
+            )
+
+        (
+            temperature_raw,
+            magnetic_x_raw,
+            magnetic_y_raw,
+            magnetic_z_raw,
+        ) = struct.unpack(
+            HALL_DATA_FORMAT,
+            hall_raw,
+        )
+
+        temperature_c = (
+            HALL_TEMPERATURE_REFERENCE_C
+            + (
+                temperature_raw
+                - HALL_TEMPERATURE_REFERENCE_RAW
+            )
+            / HALL_TEMPERATURE_LSB_PER_C
+        )
+
+        magnetic_x_gauss = (
+            magnetic_x_raw
+            / HALL_MAGNETIC_LSB_PER_MT
+            * HALL_GAUSS_PER_MT
+        )
+        magnetic_y_gauss = (
+            magnetic_y_raw
+            / HALL_MAGNETIC_LSB_PER_MT
+            * HALL_GAUSS_PER_MT
+        )
+        magnetic_z_gauss = (
+            magnetic_z_raw
+            / HALL_MAGNETIC_LSB_PER_MT
+            * HALL_GAUSS_PER_MT
+        )
+
+        magnetic_magnitude_gauss = (
+            magnetic_x_gauss ** 2
+            + magnetic_y_gauss ** 2
+            + magnetic_z_gauss ** 2
+        ) ** 0.5
+
+        return {
+            "temperature_raw": temperature_raw,
+            "magnetic_x_raw": magnetic_x_raw,
+            "magnetic_y_raw": magnetic_y_raw,
+            "magnetic_z_raw": magnetic_z_raw,
+            "temperature_c": temperature_c,
+            "magnetic_x_gauss": magnetic_x_gauss,
+            "magnetic_y_gauss": magnetic_y_gauss,
+            "magnetic_z_gauss": magnetic_z_gauss,
+            "magnetic_magnitude_gauss": magnetic_magnitude_gauss,
+        }
+
     def decode_payload(self, response_payload):
-        """将188B负载解码为压阻数据和Hall原始数据"""
+        """将188B负载解码为压阻数据和Hall磁场数据"""
 
         if not isinstance(response_payload, bytes):
             raise TypeError(
@@ -275,7 +351,7 @@ class RESPONSE_PROTOCOL:
             )
         )
 
-        # 后32B为4个Hall块，暂时只按每块8B切分
+        # 后32B为4个Hall块，每块包含温度和三轴磁场原始值
         hall_payload = response_payload[
             PIEZORESISTANCE_PAYLOAD_LEN:
         ]
@@ -286,8 +362,12 @@ class RESPONSE_PROTOCOL:
             hall_start = hall_index * HALL_SENSOR_LEN
             hall_end = hall_start + HALL_SENSOR_LEN
 
-            hall_data.append(
+            hall_raw = bytes(
                 hall_payload[hall_start:hall_end]
+            )
+
+            hall_data.append(
+                self.decode_hall_block(hall_raw)
             )
 
         return piezoresistance_data, hall_data
@@ -317,6 +397,14 @@ class TactileSensor:
         self._response_thread = None
         self._start_time_ns = None
         self.last_error = None
+        self.serial_error = None
+
+        # 运行状态统计，用于判断“没有字节”还是“收到但校验失败”
+        self.request_count = 0
+        self.transmitted_byte_count = 0
+        self.received_byte_count = 0
+        self.valid_frame_count = 0
+        self.invalid_frame_count = 0
 
         self.open_port()
 
@@ -328,6 +416,7 @@ class TactileSensor:
             port = self.port,
             baudrate = self.baudrate,
             timeout = 0.01,
+            write_timeout = 0.1,
         )
 
         # 等待串口初始化完成
@@ -361,23 +450,48 @@ class TactileSensor:
     def _request_loop(self):
 
         while self._running.is_set():
-            self.serial.write(self.request_protocol.request_frame)
+            try:
+                transmitted_byte_count = self.serial.write(
+                    self.request_protocol.request_frame
+                )
+            except (serial.SerialException, OSError) as error:
+                self._record_serial_error(error)
+                break
+
+            with self._buffer_lock:
+                self.request_count += 1
+                self.transmitted_byte_count += transmitted_byte_count
+
             time.sleep(TACTILE_SENSOR_REQUEST_INTERVAL)
 
     def _response_loop(self):
 
         while self._running.is_set():
-            waiting_bytes = self.serial.in_waiting  # 查询操作系统串口驱动接收缓冲区当前有多少字节
-            if waiting_bytes <= 0:
-                time.sleep(TACTILE_SENSOR_RESPONSE_INTERVAL)
-                continue
+            try:
+                waiting_bytes = self.serial.in_waiting  # 查询操作系统串口驱动接收缓冲区当前有多少字节
 
-            received_data = self.serial.read(waiting_bytes)
+                if waiting_bytes <= 0:
+                    time.sleep(TACTILE_SENSOR_RESPONSE_INTERVAL)
+                    continue
+
+                received_data = self.serial.read(waiting_bytes)
+            except (serial.SerialException, OSError) as error:
+                self._record_serial_error(error)
+                break
 
             if received_data:
                 with self._buffer_lock:             # with 是 Python 的“上下文管理”语句，用于保证某种资源在使用后自动释放
+                    self.received_byte_count += len(received_data)
                     self._rx_buffer.extend(received_data)
                     self._parse_response_buffer()
+
+    def _record_serial_error(self, error):
+        """保存后台线程中的串口错误，并通知两个线程停止"""
+
+        with self._buffer_lock:
+            self.serial_error = error
+
+        self._running.clear()
 
     def _parse_response_buffer(self):
         """从原始字节缓存中提取并校验完整回复帧"""
@@ -425,6 +539,7 @@ class TactileSensor:
                 )
             except (TypeError, ValueError) as error:
                 self.last_error = error
+                self.invalid_frame_count += 1
 
                 # 当前AA 55不是合法帧头，向后滑动一个字节重新搜索
                 del self._rx_buffer[:1]
@@ -435,6 +550,7 @@ class TactileSensor:
 
             # 将接收时间戳和传感器负载作为同一帧保存
             self._frame_buffer.append((timestamp_ms,response_payload))
+            self.valid_frame_count += 1
 
             # 删除已经处理的完整回复帧，继续检查后面是否还有粘包
             del self._rx_buffer[
@@ -450,8 +566,43 @@ class TactileSensor:
 
             return self._frame_buffer.popleft()     # 从 deque 最左边取出一个元素，并同时从队列中删除它
 
+    def get_status(self):
+        """返回采集线程和协议解析的运行状态快照"""
+
+        with self._buffer_lock:
+            status = {
+                "request_count": self.request_count,
+                "transmitted_byte_count": self.transmitted_byte_count,
+                "received_byte_count": self.received_byte_count,
+                "valid_frame_count": self.valid_frame_count,
+                "invalid_frame_count": self.invalid_frame_count,
+                "raw_buffer_byte_count": len(self._rx_buffer),
+                "queued_frame_count": len(self._frame_buffer),
+                "last_error": (
+                    str(self.last_error)
+                    if self.last_error is not None
+                    else None
+                ),
+                "serial_error": (
+                    str(self.serial_error)
+                    if self.serial_error is not None
+                    else None
+                ),
+            }
+
+        status["request_thread_alive"] = (
+            self._request_thread is not None
+            and self._request_thread.is_alive()
+        )
+        status["response_thread_alive"] = (
+            self._response_thread is not None
+            and self._response_thread.is_alive()
+        )
+
+        return status
+
     def decode(self, response_payload):
-        """返回(压阻数据列表, Hall原始数据列表)"""
+        """返回(压阻数据列表, Hall温度和磁场数据列表)"""
 
         return self.response_protocol.decode_payload(
             response_payload

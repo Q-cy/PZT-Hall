@@ -48,48 +48,135 @@ def format_piezoresistance(piezoresistance_data):
 
 def main():
     tactile_sensor = TactileSensor() # 实例化对象，会运行TactileSensor.__init__()
-    frame_count = 0
-    print_window_start_ms = None
-    print_window_frame_count = 0
+    latest_timestamp_ms = None
+    latest_response_payload = None
+
+    print_window_start_time = time.monotonic()
+    previous_status = tactile_sensor.get_status()
+    active_problem = None
+
+    print(
+        f"serial opened: {tactile_sensor.port} @ "
+        f"{tactile_sensor.baudrate} baud"
+    )
+    print(
+        "request frame:",
+        tactile_sensor.request_protocol.request_frame.hex(" ")
+    )
 
     try:                            # try 代码块内会进行异常捕获，捕获异常后执行 except，finally 无论如何都会执行
         while True:
             sensor_packet = tactile_sensor.read_data()
 
-            if sensor_packet is None:
-                time.sleep(0.001)
-                continue
+            if sensor_packet is not None:
+                (
+                    latest_timestamp_ms,
+                    latest_response_payload,
+                ) = sensor_packet
 
-            timestamp_ms, response_payload = sensor_packet
-            frame_count += 1
-            print_window_frame_count += 1
-
-            if print_window_start_ms is None:
-                print_window_start_ms = timestamp_ms
-
-            print_window_elapsed_ms = (
-                timestamp_ms - print_window_start_ms
+            current_time = time.monotonic()
+            print_window_elapsed_s = (
+                current_time - print_window_start_time
             )
 
-            # 主循环继续逐帧取数据，但终端每约1秒只打印一次
-            if print_window_elapsed_ms < 1000.0:
+            # 正常数据每秒打印一次；同一种故障只在首次出现时提示
+            if print_window_elapsed_s < 1.0:
+                if sensor_packet is None:
+                    time.sleep(0.001)
                 continue
 
-            frame_rate = (
-                print_window_frame_count
-                * 1000.0
-                / print_window_elapsed_ms
+            status = tactile_sensor.get_status()
+            valid_frame_count = (
+                status["valid_frame_count"]
+                - previous_status["valid_frame_count"]
             )
+            invalid_frame_count = (
+                status["invalid_frame_count"]
+                - previous_status["invalid_frame_count"]
+            )
+            received_byte_count = (
+                status["received_byte_count"]
+                - previous_status["received_byte_count"]
+            )
+            frame_rate = valid_frame_count / print_window_elapsed_s
+
+            if status["serial_error"] is not None:
+                print("serial error:", status["serial_error"])
+                break
+
+            if (
+                not status["request_thread_alive"]
+                or not status["response_thread_alive"]
+            ):
+                problem = "acquisition_thread_stopped"
+
+                if problem != active_problem:
+                    print(
+                        "acquisition thread stopped: "
+                        f"TX={status['request_thread_alive']}, "
+                        f"RX={status['response_thread_alive']}"
+                    )
+
+                active_problem = problem
+                previous_status = status
+                print_window_start_time = current_time
+                continue
+
+            if valid_frame_count <= 0:
+                if received_byte_count <= 0:
+                    problem = (
+                        "no_serial_bytes",
+                        "no bytes received from serial port"
+                    )
+                else:
+                    problem = (
+                        "no_valid_frame",
+                        "bytes were received, but no complete "
+                        "valid frame was decoded"
+                    )
+
+                if problem[0] != active_problem:
+                    print("diagnosis:", problem[1])
+
+                    if (
+                        invalid_frame_count > 0
+                        and status["last_error"] is not None
+                    ):
+                        print(
+                            "last protocol error:",
+                            status["last_error"]
+                        )
+
+                active_problem = problem[0]
+
+                previous_status = status
+                print_window_start_time = current_time
+                continue
+
+            if invalid_frame_count > 0:
+                problem = "invalid_frame"
+
+                if problem != active_problem:
+                    print(
+                        "protocol warning:",
+                        f"{invalid_frame_count} invalid frame(s);",
+                        status["last_error"]
+                    )
+
+                active_problem = problem
+            else:
+                active_problem = None
 
             piezoresistance_data, hall_data = tactile_sensor.decode(
-                response_payload
+                latest_response_payload
             )
 
             print(
-                f"frame: {frame_count} | "
-                f"timestamp: {timestamp_ms:.3f} ms | "
+                f"frame: {status['valid_frame_count']} | "
+                f"timestamp: {latest_timestamp_ms:.3f} ms | "
                 f"fps: {frame_rate:.1f} | "
-                f"payload: {len(response_payload)} bytes"
+                f"payload: {len(latest_response_payload)} bytes | "
+                f"queued: {status['queued_frame_count']}"
             )
 
             print("piezoresistance:")
@@ -99,17 +186,25 @@ def main():
                 )
             )
 
-            for hall_index, hall_raw in enumerate(
+            print(
+                "Hall  Temp(C)      Bx(G)      By(G)      Bz(G)     |B|(G)"
+            )
+
+            for hall_index, hall_sensor in enumerate(
                 hall_data,
                 start = 1,
             ):
                 print(
-                    f"hall {hall_index}:",
-                    hall_raw.hex(" "),
+                    f"{hall_index:4d} "
+                    f"{hall_sensor['temperature_c']:8.2f} "
+                    f"{hall_sensor['magnetic_x_gauss']:10.3f} "
+                    f"{hall_sensor['magnetic_y_gauss']:10.3f} "
+                    f"{hall_sensor['magnetic_z_gauss']:10.3f} "
+                    f"{hall_sensor['magnetic_magnitude_gauss']:10.3f}"
                 )
 
-            print_window_start_ms = timestamp_ms
-            print_window_frame_count = 0
+            previous_status = status
+            print_window_start_time = current_time
 
     except KeyboardInterrupt:
         print("\nstop received")
